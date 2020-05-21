@@ -62,11 +62,13 @@ import io.rsocket.test.util.TestSubscriber;
 import io.rsocket.util.ByteBufPayload;
 import io.rsocket.util.DefaultPayload;
 import io.rsocket.util.EmptyPayload;
+import java.nio.channels.ClosedChannelException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Function;
@@ -90,6 +92,7 @@ import reactor.core.publisher.Hooks;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.MonoProcessor;
 import reactor.core.publisher.UnicastProcessor;
+import reactor.core.scheduler.Schedulers;
 import reactor.test.StepVerifier;
 import reactor.test.publisher.TestPublisher;
 import reactor.test.util.RaceTestUtils;
@@ -956,7 +959,10 @@ public class RSocketRequesterTest {
       Assertions.assertThat(rule.connection.getSent())
           .extracting(FrameHeaderCodec::streamId)
           .containsExactly(i, i + 2);
-      rule.connection.getSent().clear();
+      rule.connection.getSent()
+                     .forEach(bb -> bb.release());
+      rule.connection.getSent()
+                     .clear();
     }
   }
 
@@ -976,24 +982,66 @@ public class RSocketRequesterTest {
             (BiFunction<ClientSocketRule, Payload, Publisher<?>>)
                 (r, p) -> r.socket.requestStream(p),
             (BiFunction<ClientSocketRule, Payload, Publisher<?>>)
-                (r, p) -> r.socket.requestChannel(Flux.just(p))),
+                (r, p) -> {
+                  AtomicBoolean subscribed = new AtomicBoolean();
+                  Flux<Payload> just = Flux.just(p).doOnSubscribe((__) -> subscribed.set(true));
+                  return r.socket
+                      .requestChannel(just)
+                      .doFinally(
+                          __ -> {
+                            if (!subscribed.get()) {
+                              p.release();
+                            }
+                          });
+                }),
         Arguments.of(
             (BiFunction<ClientSocketRule, Payload, Publisher<?>>)
-                (r, p) -> r.socket.requestChannel(Flux.just(p)),
+                (r, p) -> {
+                  AtomicBoolean subscribed = new AtomicBoolean();
+                  Flux<Payload> just = Flux.just(p).doOnSubscribe((__) -> subscribed.set(true));
+                  return r.socket
+                      .requestChannel(just)
+                      .doFinally(
+                          __ -> {
+                            if (!subscribed.get()) {
+                              p.release();
+                            }
+                          });
+                },
             (BiFunction<ClientSocketRule, Payload, Publisher<?>>)
                 (r, p) -> r.socket.fireAndForget(p)));
   }
 
-  public int sendRequestResponse(Publisher<Payload> response) {
-    Subscriber<Payload> sub = TestSubscriber.create();
-    response.subscribe(sub);
-    int streamId = rule.getStreamIdForRequestType(REQUEST_RESPONSE);
-    rule.connection.addToReceivedBuffer(
-        PayloadFrameCodec.encodeNextCompleteReleasingPayload(
-            rule.alloc(), streamId, EmptyPayload.INSTANCE));
-    verify(sub).onNext(any(Payload.class));
-    verify(sub).onComplete();
-    return streamId;
+  @ParameterizedTest
+  @MethodSource("streamIdRacingCases")
+  @SuppressWarnings({"rawtypes", "unchecked"})
+  public void shouldTerminateAllStreamsIfThereRacingBetweenDisposeAndRequests(
+      BiFunction<ClientSocketRule, Payload, Publisher<?>> interaction1,
+      BiFunction<ClientSocketRule, Payload, Publisher<?>> interaction2) {
+    for (int i = 1; i < 100000; i++) {
+      Payload payload1 = ByteBufPayload.create("test");
+      Payload payload2 = ByteBufPayload.create("test");
+      AssertSubscriber assertSubscriber1 = AssertSubscriber.create();
+      AssertSubscriber assertSubscriber2 = AssertSubscriber.create();
+      Publisher<?> publisher1 = interaction1.apply(rule, payload1);
+      Publisher<?> publisher2 = interaction2.apply(rule, payload2);
+      RaceTestUtils.race(
+          () -> rule.socket.dispose(),
+          () ->
+              RaceTestUtils.race(
+                  () -> publisher1.subscribe(assertSubscriber1),
+                  () -> publisher2.subscribe(assertSubscriber2),
+                  Schedulers.parallel()),
+          Schedulers.parallel());
+
+      assertSubscriber1.await().assertTerminated().assertError(ClosedChannelException.class);
+      assertSubscriber2.await().assertTerminated().assertError(ClosedChannelException.class);
+
+      Assertions.assertThat(rule.connection.getSent()).allMatch(ReferenceCounted::release);
+
+      Assertions.assertThat(payload1.refCnt()).isZero();
+      Assertions.assertThat(payload2.refCnt()).isZero();
+    }
   }
 
   public static class ClientSocketRule extends AbstractSocketRule<RSocketRequester> {
